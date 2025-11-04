@@ -1,0 +1,149 @@
+name: DevSecOps Pipeline - No Gating
+
+on:
+  push:
+    branches:
+      - "feature/**"
+  pull_request:
+    branches:
+      - "main"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+
+  # 1. BUILD et TESTS (Qualité) - Ce job DOIT toujours échouer en cas de bug de compilation/test.
+  build_test:
+    name: Build & Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test --if-present
+
+  # 2. SAST - Semgrep (Scan et Rapport SEULEMENT)
+  semgrep:
+    name: Semgrep SAST (Reporting Only)
+    runs-on: ubuntu-latest
+    needs: build_test
+    timeout-minutes: 10
+    continue-on-error: true # <--- DÉSACTIVATION DU GATING
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep (SAST) and save SARIF
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: p/owasp
+          output: semgrep.sarif
+          sarif: true
+          # L'action Semgrep est configurée pour ne pas échouer par défaut
+      
+  # 3. SAST - CodeQL (Scan et Rapport SEULEMENT)
+  codeql_sast:
+    name: CodeQL SAST Analysis (Reporting Only)
+    runs-on: ubuntu-latest
+    needs: build_test 
+    timeout-minutes: 15
+    continue-on-error: true # <--- DÉSACTIVATION DU GATING
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+        
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript 
+          
+      - name: Perform Autobuild
+        uses: github/codeql-action/autobuild@v3
+        
+      - name: Perform CodeQL Analysis (Reporting Only)
+        uses: github/codeql-action/analyze@v3
+        # L'action CodeQL ne bloquera pas le pipeline grâce à continue-on-error: true
+
+  # 4. SCA - npm audit (Scan et Rapport SEULEMENT)
+  audit:
+    name: npm audit SCA (Reporting Only)
+    runs-on: ubuntu-latest
+    needs: build_test
+    timeout-minutes: 10
+    continue-on-error: true # <--- DÉSACTIVATION DU GATING
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js (Ré-installation minimale pour l'audit)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          
+      - name: Install deps for audit
+        run: npm ci
+
+      - name: Run npm audit (Reporting Only)
+        # Utilisation de || true pour ignorer le code d'erreur 1 renvoyé par 'npm audit' en cas de faille
+        run: npm audit --audit-level=high || true 
+
+  # 5. Secrets Scanning (Scan et Rapport SEULEMENT)
+  gitleaks:
+    name: Gitleaks Secrets Detection (Reporting Only)
+    runs-on: ubuntu-latest
+    needs: build_test
+    timeout-minutes: 10
+    continue-on-error: true # <--- DÉSACTIVATION DU GATING
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: Run Gitleaks (secrets detection)
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          args: --path=. --no-git -v
+          # L'action Gitleaks n'échouera pas grâce à continue-on-error: true
+
+  # 6. SCA - Snyk (Scan et Rapport SEULEMENT)
+  snyk:
+    name: Snyk SCA (Reporting Only)
+    runs-on: ubuntu-latest
+    needs: build_test
+    if: ${{ secrets.SNYK_TOKEN != '' }}
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Snyk context)
+        run: npm ci
+
+      - name: Run Snyk (SCA) and save JSON
+        uses: snyk/actions/node@v3
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: test --json-file-output=snyk-report.json
+          # Snyk ne bloquera pas le pipeline grâce à continue-on-error: true
+      
+      - name: Upload Snyk report
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-report
+          path: snyk-report.json
